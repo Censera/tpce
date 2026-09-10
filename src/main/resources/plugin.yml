@@ -1,0 +1,56 @@
+name: tpce
+version: 0.1.0
+main: com.censera.tpce.TpcePlugin
+api-version: '26.2'
+author: Censera
+description: Small teleportation utility for Paper 26.2.
+commands:
+  tpce:
+    description: Manage tpce.
+    usage: /tpce reload
+    permission: tpce.reload
+  tpr:
+    description: Request to teleport to a player.
+    usage: /tpr [player]
+    permission: tpce.request
+  tpa:
+    description: Accept a teleport request.
+    usage: /tpa
+    permission: tpce.accept
+  tpd:
+    description: Decline a teleport request.
+    usage: /tpd
+    permission: tpce.decline
+  tpb:
+    description: Teleport back to the previous location.
+    usage: /tpb
+    permission: tpce.back
+  bed:
+    description: Teleport to your bed.
+    usage: /bed
+    permission: tpce.bed
+  home:
+    description: Manage and teleport to homes.
+    usage: /home [name|set <name> [primary]]
+    permission: tpce.home
+  spawn:
+    description: Teleport to server spawn.
+    usage: /spawn
+    permission: tpce.spawn
+permissions:
+  tpce.reload:
+    default: op
+  tpce.request:
+    default: true
+  tpce.accept:
+    default: true
+  tpce.decline:
+    default: true
+  tpce.back:
+    default: true
+  tpce.bed:
+    default: true
+  tpce.home:
+    default: true
+  tpce.spawn:
+    default: true
