@@ -9,12 +9,14 @@ import org.bukkit.block.Block;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
+import org.bukkit.command.PluginCommand;
 import org.bukkit.command.TabCompleter;
 import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.entity.EntityDamageEvent;
+import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerMoveEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.plugin.java.JavaPlugin;
@@ -22,77 +24,84 @@ import org.bukkit.scheduler.BukkitTask;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
-import java.util.Optional;
 import java.util.UUID;
 
 public final class TpcePlugin extends JavaPlugin implements Listener, CommandExecutor, TabCompleter {
+    private static final int PLAYER_PAGE_SIZE = 6;
+
     private final Map<UUID, Request> incoming = new HashMap<>();
     private final Map<UUID, Request> outgoing = new HashMap<>();
     private final Map<UUID, PendingTeleport> pendingTeleports = new HashMap<>();
-    private final Map<UUID, BukkitTask> teleportTasks = new HashMap<>();
     private final Map<UUID, Location> backLocations = new HashMap<>();
     private final Map<UUID, Long> cooldownUntil = new HashMap<>();
 
     private HomeStore homes;
-    private int requestExpirationSeconds;
-    private int teleportDelaySeconds;
-    private int teleportCooldownSeconds;
-    private boolean requireSafeDestination;
-    private boolean cancelOnMovement;
-    private boolean cancelOnDamage;
+    private Settings settings;
 
     @Override
     public void onEnable() {
         saveDefaultConfig();
-        loadConfiguration();
+        settings = readSettings();
 
-        homes = new HomeStore(this, getConfig().getInt("homes.limit"));
+        homes = new HomeStore(this, settings.homeLimit());
         try {
             homes.load();
         } catch (IOException e) {
             throw new IllegalStateException("Failed to load homes.yml", e);
         }
 
+        registerCommands();
+        Bukkit.getPluginManager().registerEvents(this, this);
+        getLogger().info("tpce enabled with " + settings.homeLimit() + " home slots per player.");
+    }
+
+    @Override
+    public void onDisable() {
+        for (PendingTeleport pending : pendingTeleports.values()) {
+            Bukkit.getScheduler().cancelTask(pending.taskId());
+        }
+        for (Request request : outgoing.values()) {
+            Bukkit.getScheduler().cancelTask(request.expirationTaskId());
+        }
+        pendingTeleports.clear();
+        incoming.clear();
+        outgoing.clear();
+
+        if (homes != null) {
+            try {
+                homes.save();
+            } catch (IOException e) {
+                getLogger().severe("Failed to save homes.yml while disabling: " + e.getMessage());
+            }
+        }
+    }
+
+    private void registerCommands() {
         for (String name : List.of("tpce", "tpr", "tpa", "tpd", "tpb", "bed", "home", "spawn")) {
-            Command command = getCommand(name);
+            PluginCommand command = getCommand(name);
             if (command == null) {
                 throw new IllegalStateException("Required command is missing from plugin.yml: " + name);
             }
             command.setExecutor(this);
             command.setTabCompleter(this);
         }
-        Bukkit.getPluginManager().registerEvents(this, this);
-        getLogger().info("tpce enabled.");
     }
 
-    @Override
-    public void onDisable() {
-        for (BukkitTask task : teleportTasks.values()) {
-            task.cancel();
-        }
-        for (Request request : incoming.values()) {
-            request.expirationTask().cancel();
-        }
-        try {
-            homes.save();
-        } catch (IOException e) {
-            getLogger().severe("Failed to save homes.yml: " + e.getMessage());
-        }
-    }
+    private Settings readSettings() {
+        int requestExpiration = requiredPositiveInt("request-expiration");
+        int teleportDelay = requiredNonNegativeInt("teleport-delay");
+        int teleportCooldown = requiredNonNegativeInt("teleport-cooldown");
 
-    private void loadConfiguration() {
-        requestExpirationSeconds = requiredPositiveInt("request-expiration");
-        teleportDelaySeconds = requiredNonNegativeInt("teleport-delay");
-        teleportCooldownSeconds = requiredNonNegativeInt("teleport-cooldown");
-
-        ConfigurationSection homeSection = getConfig().getConfigurationSection("homes");
-        if (homeSection == null) {
+        ConfigurationSection homesSection = getConfig().getConfigurationSection("homes");
+        if (homesSection == null) {
             throw new IllegalStateException("Missing configuration section: homes");
         }
-        int homeLimit = homeSection.getInt("limit", 0);
+        int homeLimit = homesSection.getInt("limit", -1);
         if (homeLimit < 1) {
             throw new IllegalStateException("Invalid configuration homes.limit: expected at least 1");
         }
@@ -101,13 +110,24 @@ public final class TpcePlugin extends JavaPlugin implements Listener, CommandExe
         if (safety == null) {
             throw new IllegalStateException("Missing configuration section: safety");
         }
-        requireSafeDestination = requireBoolean(safety, "require-safe-destination");
-        cancelOnMovement = requireBoolean(safety, "cancel-on-movement");
-        cancelOnDamage = requireBoolean(safety, "cancel-on-damage");
+
+        boolean requireSafeDestination = requiredBoolean(safety, "require-safe-destination");
+        boolean cancelOnMovement = requiredBoolean(safety, "cancel-on-movement");
+        boolean cancelOnDamage = requiredBoolean(safety, "cancel-on-damage");
+
+        return new Settings(
+                requestExpiration,
+                teleportDelay,
+                teleportCooldown,
+                homeLimit,
+                requireSafeDestination,
+                cancelOnMovement,
+                cancelOnDamage
+        );
     }
 
     private int requiredPositiveInt(String path) {
-        int value = getConfig().getInt(path, 0);
+        int value = getConfig().getInt(path, -1);
         if (value < 1) {
             throw new IllegalStateException("Invalid configuration " + path + ": expected at least 1");
         }
@@ -122,7 +142,7 @@ public final class TpcePlugin extends JavaPlugin implements Listener, CommandExe
         return value;
     }
 
-    private boolean requireBoolean(ConfigurationSection section, String path) {
+    private boolean requiredBoolean(ConfigurationSection section, String path) {
         if (!section.isBoolean(path)) {
             throw new IllegalStateException("Invalid configuration safety." + path + ": expected true or false");
         }
@@ -131,13 +151,22 @@ public final class TpcePlugin extends JavaPlugin implements Listener, CommandExe
 
     @Override
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
-        if (!(sender instanceof Player player)) {
-            sender.sendMessage("This command is only available to players.");
+        if (command.getName().equalsIgnoreCase("tpce") && args.length == 1 && args[0].equalsIgnoreCase("reload")) {
+            if (!sender.hasPermission("tpce.reload")) {
+                sender.sendMessage(Component.text("You do not have permission to reload tpce."));
+                return true;
+            }
+            reloadTpce(sender);
             return true;
         }
 
-        return switch (command.getName().toLowerCase()) {
-            case "tpce" -> handleTpce(player, args);
+        if (!(sender instanceof Player player)) {
+            sender.sendMessage(Component.text("This command is only available to players."));
+            return true;
+        }
+
+        return switch (command.getName().toLowerCase(Locale.ROOT)) {
+            case "tpce" -> showMenu(player);
             case "tpr" -> handleRequest(player, args);
             case "tpa" -> acceptRequest(player);
             case "tpd" -> declineRequest(player);
@@ -149,45 +178,111 @@ public final class TpcePlugin extends JavaPlugin implements Listener, CommandExe
         };
     }
 
-    private boolean handleTpce(Player player, String[] args) {
-        if (args.length == 1 && args[0].equalsIgnoreCase("reload")) {
-            reloadConfig();
-            loadConfiguration();
-            homes.setLimit(getConfig().getInt("homes.limit"));
-            player.sendMessage(Component.text("tpce configuration reloaded."));
-            return true;
+    private void reloadTpce(CommandSender sender) {
+        reloadConfig();
+        try {
+            Settings newSettings = readSettings();
+            homes.setLimit(newSettings.homeLimit());
+            settings = newSettings;
+            sender.sendMessage(Component.text("tpce configuration reloaded."));
+            getLogger().info("Configuration reloaded by " + sender.getName() + ".");
+        } catch (IllegalStateException e) {
+            sender.sendMessage(Component.text("Configuration reload failed: " + e.getMessage()));
+            getLogger().warning("Configuration reload rejected: " + e.getMessage());
         }
-        player.sendMessage(Component.text("Usage: /tpce reload"));
+    }
+
+    private boolean showMenu(Player player) {
+        player.sendMessage(Component.text("tpce"));
+        sendButtonLine(player, button("[ Request teleport ]", "/tpr"), button("[ Homes ]", "/home list"));
+        sendButtonLine(player, button("[ Bed ]", "/bed"), button("[ Spawn ]", "/spawn"), button("[ Back ]", "/tpb"));
+
+        Request request = incoming.get(player.getUniqueId());
+        if (request != null) {
+            Player requester = Bukkit.getPlayer(request.requester());
+            if (requester != null) {
+                player.sendMessage(Component.text("Pending request from " + requester.getName() + ":"));
+                sendButtonLine(player, button("[ Accept ]", "/tpa"), button("[ Decline ]", "/tpd"));
+            }
+        }
+
+        if (outgoing.containsKey(player.getUniqueId())) {
+            sendButtonLine(player, button("[ Cancel request ]", "/tpr cancel"));
+        }
         return true;
     }
 
     private boolean handleRequest(Player player, String[] args) {
-        if (args.length > 1) {
-            player.sendMessage(Component.text("Usage: /tpr [player]"));
+        if (args.length == 0 || args[0].equalsIgnoreCase("list")) {
+            showPlayerPage(player, 0);
+            return true;
+        }
+        if (args[0].equalsIgnoreCase("cancel") && args.length == 1) {
+            cancelOutgoingRequest(player, true);
+            return true;
+        }
+        if (args[0].equalsIgnoreCase("page")) {
+            if (args.length != 2) {
+                player.sendMessage(Component.text("Usage: /tpr page <number>"));
+                return true;
+            }
+            try {
+                int page = Integer.parseInt(args[1]);
+                if (page < 1) {
+                    throw new NumberFormatException();
+                }
+                showPlayerPage(player, page - 1);
+            } catch (NumberFormatException e) {
+                player.sendMessage(Component.text("Page must be a positive number."));
+            }
             return true;
         }
         if (args.length == 1) {
-            Optional<Player> target = Optional.ofNullable(Bukkit.getPlayerExact(args[0]));
-            if (target.isEmpty()) {
+            Player target = Bukkit.getPlayerExact(args[0]);
+            if (target == null) {
                 player.sendMessage(Component.text("Player is not online: " + args[0]));
                 return true;
             }
-            sendRequest(player, target.get());
+            sendRequest(player, target);
             return true;
         }
+        player.sendMessage(Component.text("Usage: /tpr [player|cancel|page <number>]"));
+        return true;
+    }
 
+    private void showPlayerPage(Player player, int page) {
         List<Player> players = new ArrayList<>(Bukkit.getOnlinePlayers());
         players.remove(player);
+        players.sort(Comparator.comparing(Player::getName, String.CASE_INSENSITIVE_ORDER));
+
         if (players.isEmpty()) {
             player.sendMessage(Component.text("No other players are online."));
-            return true;
+            return;
         }
 
-        player.sendMessage(Component.text("Who do you want to teleport to?"));
-        for (Player target : players) {
+        int pageCount = (players.size() + PLAYER_PAGE_SIZE - 1) / PLAYER_PAGE_SIZE;
+        if (page >= pageCount) {
+            page = pageCount - 1;
+        }
+        int start = page * PLAYER_PAGE_SIZE;
+        int end = Math.min(start + PLAYER_PAGE_SIZE, players.size());
+
+        player.sendMessage(Component.text("Who do you want to teleport to? Page " + (page + 1) + "/" + pageCount));
+        for (int index = start; index < end; index++) {
+            Player target = players.get(index);
             player.sendMessage(button(target.getName(), "/tpr " + target.getName()));
         }
-        return true;
+
+        List<Component> navigation = new ArrayList<>();
+        if (page > 0) {
+            navigation.add(button("[ Previous ]", "/tpr page " + page));
+        }
+        if (page + 1 < pageCount) {
+            navigation.add(button("[ Next ]", "/tpr page " + (page + 2)));
+        }
+        if (!navigation.isEmpty()) {
+            sendButtonLine(player, navigation.toArray(Component[]::new));
+        }
     }
 
     private void sendRequest(Player requester, Player target) {
@@ -195,28 +290,34 @@ public final class TpcePlugin extends JavaPlugin implements Listener, CommandExe
             requester.sendMessage(Component.text("You cannot teleport to yourself."));
             return;
         }
-        if (outgoing.containsKey(requester.getUniqueId())) {
-            cancelRequest(requester.getUniqueId(), "Your previous teleport request was cancelled.");
-        }
-        if (incoming.containsKey(target.getUniqueId())) {
+
+        Request existingIncoming = incoming.get(target.getUniqueId());
+        if (existingIncoming != null && !existingIncoming.requester().equals(requester.getUniqueId())) {
             requester.sendMessage(Component.text(target.getName() + " already has a pending teleport request."));
             return;
         }
 
+        Request existingOutgoing = outgoing.get(requester.getUniqueId());
+        if (existingOutgoing != null) {
+            if (existingOutgoing.target().equals(target.getUniqueId())) {
+                requester.sendMessage(Component.text("You already have a request pending for " + target.getName() + "."));
+                return;
+            }
+            cancelOutgoingRequest(requester, false);
+        }
+
         UUID requesterId = requester.getUniqueId();
         UUID targetId = target.getUniqueId();
-        BukkitTask expiration = Bukkit.getScheduler().runTaskLater(
-                this, () -> expireRequest(requesterId), requestExpirationSeconds * 20L);
-        Request request = new Request(requesterId, targetId, expiration);
+        long ticks = secondsToTicks(settings.requestExpirationSeconds());
+        BukkitTask expiration = Bukkit.getScheduler().runTaskLater(this,
+                () -> expireRequest(requesterId), ticks);
+        Request request = new Request(requesterId, targetId, expiration.getTaskId());
         outgoing.put(requesterId, request);
         incoming.put(targetId, request);
 
         requester.sendMessage(Component.text("Teleport request sent to " + target.getName() + "."));
         target.sendMessage(Component.text(requester.getName() + " wants to teleport to you."));
-        target.sendMessage(buttons(
-                button("[ Accept ]", "/tpa"),
-                button("[ Decline ]", "/tpd")
-        ));
+        sendButtonLine(target, button("[ Accept ]", "/tpa"), button("[ Decline ]", "/tpd"));
     }
 
     private boolean acceptRequest(Player target) {
@@ -226,17 +327,17 @@ public final class TpcePlugin extends JavaPlugin implements Listener, CommandExe
             return true;
         }
         outgoing.remove(request.requester(), request);
-        request.expirationTask().cancel();
+        Bukkit.getScheduler().cancelTask(request.expirationTaskId());
 
-        Optional<Player> requester = Optional.ofNullable(Bukkit.getPlayer(request.requester()));
-        if (requester.isEmpty()) {
+        Player requester = Bukkit.getPlayer(request.requester());
+        if (requester == null) {
             target.sendMessage(Component.text("The requester is no longer online."));
             return true;
         }
 
         target.sendMessage(Component.text("Teleport request accepted."));
-        requester.get().sendMessage(Component.text(target.getName() + " accepted your teleport request."));
-        beginTeleport(requester.get(), target.getLocation(), target.getName());
+        requester.sendMessage(Component.text(target.getName() + " accepted your teleport request."));
+        beginTeleport(requester, target.getLocation(), target.getName());
         return true;
     }
 
@@ -247,10 +348,13 @@ public final class TpcePlugin extends JavaPlugin implements Listener, CommandExe
             return true;
         }
         outgoing.remove(request.requester(), request);
-        request.expirationTask().cancel();
-        Optional<Player> requester = Optional.ofNullable(Bukkit.getPlayer(request.requester()));
+        Bukkit.getScheduler().cancelTask(request.expirationTaskId());
+
         target.sendMessage(Component.text("Teleport request declined."));
-        requester.ifPresent(value -> value.sendMessage(Component.text(target.getName() + " declined your teleport request.")));
+        Player requester = Bukkit.getPlayer(request.requester());
+        if (requester != null) {
+            requester.sendMessage(Component.text(target.getName() + " declined your teleport request."));
+        }
         return true;
     }
 
@@ -260,81 +364,149 @@ public final class TpcePlugin extends JavaPlugin implements Listener, CommandExe
             return;
         }
         incoming.remove(request.target(), request);
-        Optional.ofNullable(Bukkit.getPlayer(requesterId))
-                .ifPresent(player -> player.sendMessage(Component.text("Teleport request expired.")));
-        Optional.ofNullable(Bukkit.getPlayer(request.target()))
-                .ifPresent(player -> player.sendMessage(Component.text("Teleport request expired.")));
+
+        Player requester = Bukkit.getPlayer(requesterId);
+        if (requester != null) {
+            requester.sendMessage(Component.text("Teleport request expired."));
+        }
+        Player target = Bukkit.getPlayer(request.target());
+        if (target != null) {
+            target.sendMessage(Component.text("Teleport request expired."));
+        }
     }
 
-    private void cancelRequest(UUID requesterId, String message) {
-        Request request = outgoing.remove(requesterId);
+    private void cancelOutgoingRequest(Player requester, boolean notify) {
+        Request request = outgoing.remove(requester.getUniqueId());
         if (request == null) {
+            if (notify) {
+                requester.sendMessage(Component.text("You have no outgoing teleport request."));
+            }
             return;
         }
         incoming.remove(request.target(), request);
-        request.expirationTask().cancel();
-        Optional.ofNullable(Bukkit.getPlayer(requesterId))
-                .ifPresent(player -> player.sendMessage(Component.text(message)));
+        Bukkit.getScheduler().cancelTask(request.expirationTaskId());
+        if (notify) {
+            requester.sendMessage(Component.text("Teleport request cancelled."));
+        }
     }
 
     private boolean handleHome(Player player, String[] args) {
         if (args.length == 0) {
-            Optional<Location> primary = homes.getPrimary(player.getUniqueId());
+            var primary = homes.getPrimary(player.getUniqueId());
             if (primary.isPresent()) {
-                beginTeleport(player, primary.get(), "home");
-                return true;
+                beginTeleport(player, primary.get(), "primary home");
+            } else {
+                showHomes(player);
             }
+            return true;
+        }
+
+        if (args[0].equalsIgnoreCase("list") && args.length == 1) {
             showHomes(player);
             return true;
         }
+
         if (args[0].equalsIgnoreCase("set")) {
             if (args.length < 2 || args.length > 3) {
                 player.sendMessage(Component.text("Usage: /home set <name> [primary]"));
                 return true;
             }
             String name = args[1].trim();
-            if (name.isEmpty() || name.length() > 32 || name.contains(" ")) {
-                player.sendMessage(Component.text("Home name must be 1-32 characters without spaces."));
+            if (!isValidHomeName(name)) {
+                player.sendMessage(Component.text("Home name must be 1-32 characters using letters, numbers, '-' or '_'."));
                 return true;
             }
-            if (!homes.set(player.getUniqueId(), name, player.getLocation())) {
-                player.sendMessage(Component.text("You have reached the maximum number of homes."));
+            boolean primary = args.length == 3;
+            if (primary && !args[2].equalsIgnoreCase("primary")) {
+                player.sendMessage(Component.text("Usage: /home set <name> [primary]"));
                 return true;
             }
-            if (args.length == 3 && args[2].equalsIgnoreCase("primary")) {
-                homes.setPrimary(player.getUniqueId(), name);
+            try {
+                homes.set(player.getUniqueId(), name, player.getLocation());
+                if (primary) {
+                    homes.setPrimary(player.getUniqueId(), name);
+                }
+            } catch (IOException e) {
+                player.sendMessage(Component.text("Home save failed. Your home was not changed."));
+                getLogger().severe("Failed to save home " + name + " for " + player.getName() + ": " + e.getMessage());
+                return true;
             }
-            saveHomes(player);
             player.sendMessage(Component.text("Home saved: " + name + "."));
             return true;
         }
+
+        if (args[0].equalsIgnoreCase("delete") && args.length == 2) {
+            String name = args[1];
+            try {
+                if (!homes.delete(player.getUniqueId(), name)) {
+                    player.sendMessage(Component.text("Home does not exist: " + name));
+                    return true;
+                }
+            } catch (IOException e) {
+                player.sendMessage(Component.text("Home delete failed. Your home was not changed."));
+                getLogger().severe("Failed to delete home " + name + " for " + player.getName() + ": " + e.getMessage());
+                return true;
+            }
+            player.sendMessage(Component.text("Home deleted: " + name + "."));
+            return true;
+        }
+
+        if (args[0].equalsIgnoreCase("primary") && args.length == 2) {
+            String name = args[1];
+            try {
+                if (!homes.setPrimary(player.getUniqueId(), name)) {
+                    player.sendMessage(Component.text("Home does not exist: " + name));
+                    return true;
+                }
+            } catch (IOException e) {
+                player.sendMessage(Component.text("Primary home update failed. Your home was not changed."));
+                getLogger().severe("Failed to set primary home " + name + " for " + player.getName() + ": " + e.getMessage());
+                return true;
+            }
+            player.sendMessage(Component.text("Primary home set: " + name + "."));
+            return true;
+        }
+
         if (args.length == 1) {
-            String name = args[0];
-            Optional<Location> home = homes.get(player.getUniqueId(), name);
+            var home = homes.get(player.getUniqueId(), args[0]);
             if (home.isEmpty()) {
-                player.sendMessage(Component.text("Home does not exist: " + name));
+                player.sendMessage(Component.text("Home does not exist: " + args[0]));
                 showHomes(player);
                 return true;
             }
-            beginTeleport(player, home.get(), "home " + name);
+            beginTeleport(player, home.get(), "home " + args[0]);
             return true;
         }
-        player.sendMessage(Component.text("Usage: /home [name|set <name> [primary]]"));
+
+        player.sendMessage(Component.text("Usage: /home [name|list|set <name> [primary]|delete <name>|primary <name>]"));
         return true;
     }
 
     private void showHomes(Player player) {
         List<String> names = homes.names(player.getUniqueId());
         if (names.isEmpty()) {
-            player.sendMessage(Component.text("You have no homes. Use /home set <name> to create one."));
+            player.sendMessage(Component.text("You have no homes."));
+            sendButtonLine(player, button("[ Set home-1 here ]", "/home set home-1"));
             return;
         }
+
         player.sendMessage(Component.text("Homes:"));
+        String primary = homes.primaryName(player.getUniqueId()).orElse("");
         for (String name : names) {
-            player.sendMessage(button(name, "/home " + name));
+            Component line = button(name + (name.equals(primary) ? " (primary)" : ""), "/home " + name)
+                    .append(Component.text(" "))
+                    .append(button("[ Primary ]", "/home primary " + name))
+                    .append(Component.text(" "))
+                    .append(button("[ Delete ]", "/home delete " + name));
+            player.sendMessage(line);
         }
-        homes.primaryName(player.getUniqueId()).ifPresent(primary ->
-                player.sendMessage(Component.text("Primary home: " + primary)));
+
+        for (int slot = 1; slot <= settings.homeLimit(); slot++) {
+            String defaultName = "home-" + slot;
+            if (!names.contains(defaultName) && names.size() < settings.homeLimit()) {
+                sendButtonLine(player, button("[ Set " + defaultName + " here ]", "/home set " + defaultName));
+            }
+        }
     }
 
     private boolean teleportBack(Player player) {
@@ -348,12 +520,12 @@ public final class TpcePlugin extends JavaPlugin implements Listener, CommandExe
     }
 
     private boolean teleportBed(Player player) {
-        Optional<Location> destination = Optional.ofNullable(player.getRespawnLocation());
-        if (destination.isEmpty()) {
+        Location destination = player.getRespawnLocation();
+        if (destination == null) {
             player.sendMessage(Component.text("You do not have a valid bed location."));
             return true;
         }
-        beginTeleport(player, destination.get(), "bed");
+        beginTeleport(player, destination, "bed");
         return true;
     }
 
@@ -372,24 +544,33 @@ public final class TpcePlugin extends JavaPlugin implements Listener, CommandExe
             return;
         }
 
-        Optional<World> world = Optional.ofNullable(destination.getWorld());
-        if (world.isEmpty() || !Bukkit.getWorlds().contains(world.get())) {
+        World world = destination.getWorld();
+        if (world == null || Bukkit.getWorld(world.getUID()) == null) {
             player.sendMessage(Component.text("Teleport failed: destination world is unavailable."));
+            getLogger().warning("Teleport rejected for " + player.getName() + ": unavailable world for " + reason + ".");
             return;
         }
-        if (requireSafeDestination && !isSafe(destination)) {
+        if (settings.requireSafeDestination() && !isSafe(destination)) {
             player.sendMessage(Component.text("That destination is not safe."));
             return;
         }
 
         cancelTeleport(player, false);
         Location source = player.getLocation().clone();
-        PendingTeleport pending = new PendingTeleport(source, destination.clone(), reason);
-        BukkitTask task = Bukkit.getScheduler().runTaskLater(
-                this, () -> completeTeleport(player, pending), teleportDelaySeconds * 20L);
-        pendingTeleports.put(id, pending);
-        teleportTasks.put(id, task);
-        player.sendMessage(Component.text("Teleporting in " + teleportDelaySeconds + " seconds..."));
+        Location target = destination.clone();
+        long ticks = secondsToTicks(settings.teleportDelaySeconds());
+        final UUID playerId = player.getUniqueId();
+        final long[] taskId = new long[1];
+        BukkitTask task = Bukkit.getScheduler().runTaskLater(this, () -> {
+            PendingTeleport pending = pendingTeleports.get(playerId);
+            if (pending == null || pending.taskId() != taskId[0]) {
+                return;
+            }
+            completeTeleport(player, pending);
+        }, ticks);
+        taskId[0] = task.getTaskId();
+        pendingTeleports.put(id, new PendingTeleport(source, target, reason, task.getTaskId()));
+        player.sendMessage(Component.text("Teleporting in " + settings.teleportDelaySeconds() + " seconds..."));
     }
 
     private void completeTeleport(Player player, PendingTeleport pending) {
@@ -398,87 +579,107 @@ public final class TpcePlugin extends JavaPlugin implements Listener, CommandExe
             return;
         }
         pendingTeleports.remove(id);
-        teleportTasks.remove(id);
+
         if (!player.isOnline()) {
             return;
         }
-        if (requireSafeDestination && !isSafe(pending.destination())) {
+        if (settings.requireSafeDestination() && !isSafe(pending.destination())) {
             player.sendMessage(Component.text("Teleport failed: the destination is no longer safe."));
             return;
         }
         if (!player.teleport(pending.destination())) {
             player.sendMessage(Component.text("Teleport failed: the server rejected the teleport."));
-            getLogger().warning("Teleport rejected for " + player.getName() + " to " + pending.reason());
+            getLogger().warning("Teleport rejected for " + player.getName() + " to " + pending.reason() + ".");
             return;
         }
+
         backLocations.put(id, pending.source());
-        cooldownUntil.put(id, System.currentTimeMillis() + teleportCooldownSeconds * 1000L);
+        if (settings.teleportCooldownSeconds() > 0) {
+            cooldownUntil.put(id, System.currentTimeMillis() + settings.teleportCooldownSeconds() * 1000L);
+        }
         player.sendMessage(Component.text("Teleported to " + pending.reason() + "."));
     }
 
     private void cancelTeleport(Player player, boolean notify) {
         UUID id = player.getUniqueId();
-        pendingTeleports.remove(id);
-        Optional.ofNullable(teleportTasks.remove(id)).ifPresent(BukkitTask::cancel);
+        PendingTeleport pending = pendingTeleports.remove(id);
+        if (pending == null) {
+            return;
+        }
+        Bukkit.getScheduler().cancelTask(pending.taskId());
         if (notify) {
             player.sendMessage(Component.text("Teleport cancelled."));
         }
     }
 
     private boolean isSafe(Location location) {
+        World world = location.getWorld();
+        if (world == null) {
+            return false;
+        }
         Block feet = location.getBlock();
         Block head = feet.getRelative(0, 1, 0);
         Block ground = feet.getRelative(0, -1, 0);
         return feet.isPassable() && head.isPassable() && ground.getType().isSolid();
     }
 
-    private void saveHomes(Player player) {
-        try {
-            homes.save();
-        } catch (IOException e) {
-            player.sendMessage(Component.text("Home saved in memory, but persistent storage failed."));
-            getLogger().severe("Failed to save homes.yml after change by " + player.getName() + ": " + e.getMessage());
-        }
-    }
-
     @EventHandler
     public void onMove(PlayerMoveEvent event) {
-        if (!cancelOnMovement || event.getTo() == null) {
+        if (!settings.cancelOnMovement()) {
             return;
         }
         Location from = event.getFrom();
         Location to = event.getTo();
+        if (to == null) {
+            return;
+        }
         if (from.getX() == to.getX() && from.getY() == to.getY() && from.getZ() == to.getZ()) {
             return;
         }
-        if (pendingTeleports.containsKey(event.getPlayer().getUniqueId())) {
-            cancelTeleport(event.getPlayer(), true);
-        }
+        cancelTeleport(event.getPlayer(), true);
     }
 
     @EventHandler
     public void onDamage(EntityDamageEvent event) {
-        if (!(event.getEntity() instanceof Player player) || !cancelOnDamage) {
+        if (!settings.cancelOnDamage() || event.isCancelled() || !(event.getEntity() instanceof Player player)) {
             return;
         }
-        if (pendingTeleports.containsKey(player.getUniqueId())) {
-            cancelTeleport(player, true);
-        }
+        cancelTeleport(player, true);
+    }
+
+    @EventHandler
+    public void onJoin(PlayerJoinEvent event) {
+        sendButtonLine(event.getPlayer(), Component.text("Teleport options: "), button("[ Open ]", "/tpce"));
     }
 
     @EventHandler
     public void onQuit(PlayerQuitEvent event) {
-        UUID id = event.getPlayer().getUniqueId();
-        cancelTeleport(event.getPlayer(), false);
+        Player player = event.getPlayer();
+        UUID id = player.getUniqueId();
+
+        cancelTeleport(player, false);
+        backLocations.remove(id);
+        cooldownUntil.remove(id);
 
         Request incomingRequest = incoming.remove(id);
         if (incomingRequest != null) {
             outgoing.remove(incomingRequest.requester(), incomingRequest);
-            incomingRequest.expirationTask().cancel();
-            Optional.ofNullable(Bukkit.getPlayer(incomingRequest.requester()))
-                    .ifPresent(player -> player.sendMessage(Component.text("Teleport request cancelled because the target left.")));
+            Bukkit.getScheduler().cancelTask(incomingRequest.expirationTaskId());
+            Player requester = Bukkit.getPlayer(incomingRequest.requester());
+            if (requester != null) {
+                requester.sendMessage(Component.text(player.getName() + " is no longer online. Teleport request cancelled."));
+            }
         }
-        cancelRequest(id, "Teleport request cancelled because you left the server.");
+
+        Request outgoingRequest = outgoing.remove(id);
+        if (outgoingRequest != null) {
+            incoming.remove(outgoingRequest.target(), outgoingRequest);
+            Bukkit.getScheduler().cancelTask(outgoingRequest.expirationTaskId());
+            Player target = Bukkit.getPlayer(outgoingRequest.target());
+            if (target != null) {
+                target.sendMessage(Component.text(player.getName() + " is no longer online. Teleport request cancelled."));
+            }
+        }
     }
 
     @Override
@@ -486,41 +687,89 @@ public final class TpcePlugin extends JavaPlugin implements Listener, CommandExe
         if (!(sender instanceof Player player)) {
             return List.of();
         }
-        String name = command.getName().toLowerCase();
-        if (name.equals("tpce")) {
-            return args.length == 1 ? List.of("reload") : List.of();
-        }
-        if (name.equals("tpr") && args.length == 1) {
-            String prefix = args[0].toLowerCase();
-            return Bukkit.getOnlinePlayers().stream()
-                    .filter(other -> !other.equals(player))
-                    .map(Player::getName)
-                    .filter(other -> other.toLowerCase().startsWith(prefix))
-                    .sorted()
-                    .toList();
+        String name = command.getName().toLowerCase(Locale.ROOT);
+        if (name.equals("tpr")) {
+            if (args.length == 1) {
+                List<String> suggestions = new ArrayList<>(List.of("cancel", "page"));
+                for (Player online : Bukkit.getOnlinePlayers()) {
+                    if (!online.equals(player)) {
+                        suggestions.add(online.getName());
+                    }
+                }
+                return partial(suggestions, args[0]);
+            }
         }
         if (name.equals("home")) {
+            List<String> suggestions = new ArrayList<>(List.of("list", "set", "delete", "primary"));
             if (args.length == 1) {
-                List<String> result = new ArrayList<>(homes.names(player.getUniqueId()));
-                result.add("set");
-                return result.stream().filter(value -> value.startsWith(args[0].toLowerCase())).toList();
+                suggestions.addAll(homes.names(player.getUniqueId()));
+                return partial(suggestions, args[0]);
             }
-            if (args.length == 2 && args[0].equalsIgnoreCase("set")) {
-                return List.of("primary");
+            if (args.length == 2 && (args[0].equalsIgnoreCase("delete") || args[0].equalsIgnoreCase("primary"))) {
+                return partial(homes.names(player.getUniqueId()), args[1]);
             }
         }
+        if (name.equals("tpce") && args.length == 1) {
+            return partial(List.of("reload"), args[0]);
+        }
         return List.of();
+    }
+
+    private static List<String> partial(List<String> values, String input) {
+        String prefix = input.toLowerCase(Locale.ROOT);
+        return values.stream()
+                .filter(value -> value.toLowerCase(Locale.ROOT).startsWith(prefix))
+                .distinct()
+                .sorted(String.CASE_INSENSITIVE_ORDER)
+                .toList();
     }
 
     private static Component button(String label, String command) {
         return Component.text(label).clickEvent(ClickEvent.runCommand(command));
     }
 
-    private static Component buttons(Component first, Component second) {
-        return first.append(Component.text(" ")).append(second);
+    private static void sendButtonLine(Player player, Component... components) {
+        Component line = Component.empty();
+        for (int i = 0; i < components.length; i++) {
+            if (i > 0) {
+                line = line.append(Component.text(" "));
+            }
+            line = line.append(components[i]);
+        }
+        player.sendMessage(line);
     }
 
-    private record Request(UUID requester, UUID target, BukkitTask expirationTask) { }
+    private static boolean isValidHomeName(String name) {
+        if (name.isEmpty() || name.length() > 32) {
+            return false;
+        }
+        for (int i = 0; i < name.length(); i++) {
+            char c = name.charAt(i);
+            if (!(Character.isLetterOrDigit(c) || c == '-' || c == '_')) {
+                return false;
+            }
+        }
+        return true;
+    }
 
-    private record PendingTeleport(Location source, Location destination, String reason) { }
+    private static long secondsToTicks(int seconds) {
+        return seconds * 20L;
+    }
+
+    private record Settings(
+            int requestExpirationSeconds,
+            int teleportDelaySeconds,
+            int teleportCooldownSeconds,
+            int homeLimit,
+            boolean requireSafeDestination,
+            boolean cancelOnMovement,
+            boolean cancelOnDamage
+    ) {
+    }
+
+    private record Request(UUID requester, UUID target, long expirationTaskId) {
+    }
+
+    private record PendingTeleport(Location source, Location destination, String reason, long taskId) {
+    }
 }
