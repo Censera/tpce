@@ -1,0 +1,9 @@
+request-expiration: 60
+teleport-delay: 3
+teleport-cooldown: 5
+homes:
+  limit: 3
+safety:
+  require-safe-destination: true
+  cancel-on-movement: true
+  cancel-on-damage: true
