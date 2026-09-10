@@ -59,7 +59,8 @@ final class HomeStore {
                 continue;
             }
 
-            section.getString("primary").ifPresent(name -> primary.put(playerId, normalize(name)));
+            Optional.ofNullable(section.getString("primary"))
+                    .ifPresent(name -> primary.put(playerId, normalize(name)));
 
             ConfigurationSection playerHomes = section.getConfigurationSection("homes");
             if (playerHomes == null) {
@@ -72,7 +73,7 @@ final class HomeStore {
                 if (home == null) {
                     continue;
                 }
-                Optional<String> worldId = home.getString("world");
+                Optional<String> worldId = Optional.ofNullable(home.getString("world"));
                 if (worldId.isEmpty()) {
                     plugin.getLogger().warning("Ignoring home " + name + " for " + playerId + ": world is missing");
                     continue;
@@ -107,7 +108,8 @@ final class HomeStore {
         YamlConfiguration config = new YamlConfiguration();
         for (Map.Entry<UUID, Map<String, Location>> player : homes.entrySet()) {
             String base = "players." + player.getKey();
-            primary.get(player.getKey()).ifPresent(name -> config.set(base + ".primary", name));
+            Optional.ofNullable(primary.get(player.getKey()))
+                    .ifPresent(name -> config.set(base + ".primary", name));
             for (Map.Entry<String, Location> home : player.getValue().entrySet()) {
                 String path = base + ".homes." + home.getKey();
                 Location location = home.getValue();
@@ -149,7 +151,7 @@ final class HomeStore {
         if (playerHomes.remove(key) == null) {
             return false;
         }
-        if (key.equals(primary.get(player).orElse(""))) {
+        if (key.equals(primary.get(player))) {
             primary.remove(player);
         }
         if (playerHomes.isEmpty()) {
@@ -179,7 +181,8 @@ final class HomeStore {
     }
 
     Optional<Location> getPrimary(UUID player) {
-        return primary.get(player).flatMap(name -> get(player, name));
+        String name = primary.get(player);
+        return name == null ? Optional.empty() : get(player, name);
     }
 
     java.util.List<String> names(UUID player) {
@@ -190,7 +193,7 @@ final class HomeStore {
     }
 
     Optional<String> primaryName(UUID player) {
-        return primary.get(player);
+        return Optional.ofNullable(primary.get(player));
     }
 
     private static String normalize(String name) {
