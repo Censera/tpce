@@ -13,6 +13,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 
 final class HomeStore {
@@ -58,10 +59,7 @@ final class HomeStore {
                 continue;
             }
 
-            String primaryName = section.getString("primary");
-            if (primaryName != null) {
-                primary.put(playerId, primaryName.toLowerCase());
-            }
+            section.getString("primary").ifPresent(name -> primary.put(playerId, normalize(name)));
 
             ConfigurationSection playerHomes = section.getConfigurationSection("homes");
             if (playerHomes == null) {
@@ -74,11 +72,15 @@ final class HomeStore {
                 if (home == null) {
                     continue;
                 }
-                String worldId = home.getString("world");
+                Optional<String> worldId = home.getString("world");
+                if (worldId.isEmpty()) {
+                    plugin.getLogger().warning("Ignoring home " + name + " for " + playerId + ": world is missing");
+                    continue;
+                }
                 World world;
                 try {
-                    world = Bukkit.getWorld(UUID.fromString(worldId));
-                } catch (Exception e) {
+                    world = Bukkit.getWorld(UUID.fromString(worldId.get()));
+                } catch (IllegalArgumentException e) {
                     plugin.getLogger().warning("Ignoring home " + name + " for " + playerId + ": invalid world");
                     continue;
                 }
@@ -86,7 +88,7 @@ final class HomeStore {
                     plugin.getLogger().warning("Ignoring home " + name + " for " + playerId + ": world is unavailable");
                     continue;
                 }
-                loaded.put(name.toLowerCase(), new Location(
+                loaded.put(normalize(name), new Location(
                         world,
                         home.getDouble("x"),
                         home.getDouble("y"),
@@ -105,10 +107,7 @@ final class HomeStore {
         YamlConfiguration config = new YamlConfiguration();
         for (Map.Entry<UUID, Map<String, Location>> player : homes.entrySet()) {
             String base = "players." + player.getKey();
-            String primaryName = primary.get(player.getKey());
-            if (primaryName != null) {
-                config.set(base + ".primary", primaryName);
-            }
+            primary.get(player.getKey()).ifPresent(name -> config.set(base + ".primary", name));
             for (Map.Entry<String, Location> home : player.getValue().entrySet()) {
                 String path = base + ".homes." + home.getKey();
                 Location location = home.getValue();
@@ -150,7 +149,7 @@ final class HomeStore {
         if (playerHomes.remove(key) == null) {
             return false;
         }
-        if (key.equals(primary.get(player))) {
+        if (key.equals(primary.get(player).orElse(""))) {
             primary.remove(player);
         }
         if (playerHomes.isEmpty()) {
@@ -170,18 +169,17 @@ final class HomeStore {
         return true;
     }
 
-    Location get(UUID player, String name) {
+    Optional<Location> get(UUID player, String name) {
         Map<String, Location> playerHomes = homes.get(player);
         if (playerHomes == null) {
-            return null;
+            return Optional.empty();
         }
         Location location = playerHomes.get(normalize(name));
-        return location == null ? null : location.clone();
+        return location == null ? Optional.empty() : Optional.of(location.clone());
     }
 
-    Location getPrimary(UUID player) {
-        String name = primary.get(player);
-        return name == null ? null : get(player, name);
+    Optional<Location> getPrimary(UUID player) {
+        return primary.get(player).flatMap(name -> get(player, name));
     }
 
     java.util.List<String> names(UUID player) {
@@ -191,7 +189,7 @@ final class HomeStore {
                 : Collections.unmodifiableList(new ArrayList<>(playerHomes.keySet()));
     }
 
-    String primaryName(UUID player) {
+    Optional<String> primaryName(UUID player) {
         return primary.get(player);
     }
 
