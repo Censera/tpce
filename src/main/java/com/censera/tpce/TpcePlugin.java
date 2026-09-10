@@ -4,8 +4,6 @@ import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.event.ClickEvent;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
-import org.bukkit.World;
-import org.bukkit.block.Block;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
@@ -20,27 +18,21 @@ import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerMoveEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.plugin.java.JavaPlugin;
-import org.bukkit.scheduler.BukkitTask;
 
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
-import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 
 public final class TpcePlugin extends JavaPlugin implements Listener, CommandExecutor, TabCompleter {
     private static final int PLAYER_PAGE_SIZE = 6;
 
-    private final Map<UUID, Request> incoming = new HashMap<>();
-    private final Map<UUID, Request> outgoing = new HashMap<>();
-    private final Map<UUID, PendingTeleport> pendingTeleports = new HashMap<>();
-    private final Map<UUID, Location> backLocations = new HashMap<>();
-    private final Map<UUID, Long> cooldownUntil = new HashMap<>();
-
     private HomeStore homes;
+    private RequestManager requests;
+    private TeleportService teleports;
     private Settings settings;
 
     @Override
@@ -53,6 +45,8 @@ public final class TpcePlugin extends JavaPlugin implements Listener, CommandExe
         } catch (IOException e) {
             throw new IllegalStateException("Failed to load homes.yml", e);
         }
+        teleports = new TeleportService(this, () -> settings);
+        requests = new RequestManager(this, () -> settings.requestExpirationSeconds(), this::notifyExpired);
         registerCommands();
         Bukkit.getPluginManager().registerEvents(this, this);
         getLogger().info("tpce enabled with " + settings.homeLimit() + " home slots per player.");
@@ -60,15 +54,8 @@ public final class TpcePlugin extends JavaPlugin implements Listener, CommandExe
 
     @Override
     public void onDisable() {
-        for (PendingTeleport pending : pendingTeleports.values()) {
-            pending.task().cancel();
-        }
-        for (Request request : outgoing.values()) {
-            request.expirationTask().cancel();
-        }
-        pendingTeleports.clear();
-        incoming.clear();
-        outgoing.clear();
+        if (teleports != null) teleports.shutdown();
+        if (requests != null) requests.shutdown();
         if (homes != null) {
             try {
                 homes.save();
@@ -76,6 +63,13 @@ public final class TpcePlugin extends JavaPlugin implements Listener, CommandExe
                 getLogger().severe("Failed to save homes.yml while disabling: " + e.getMessage());
             }
         }
+    }
+
+    private void notifyExpired(UUID requesterId, UUID targetId) {
+        Player requester = Bukkit.getPlayer(requesterId);
+        if (requester != null) requester.sendMessage(Component.text("Teleport request expired."));
+        Player target = Bukkit.getPlayer(targetId);
+        if (target != null) target.sendMessage(Component.text("Teleport request expired."));
     }
 
     private void registerCommands() {
@@ -179,15 +173,15 @@ public final class TpcePlugin extends JavaPlugin implements Listener, CommandExe
         player.sendMessage(Component.text("tpce"));
         sendButtonLine(player, button("[ Request teleport ]", "/tpr"), button("[ Homes ]", "/home list"));
         sendButtonLine(player, button("[ Bed ]", "/bed"), button("[ Spawn ]", "/spawn"), button("[ Back ]", "/tpb"));
-        Request request = incoming.get(player.getUniqueId());
-        if (request != null) {
-            Player requester = Bukkit.getPlayer(request.requester());
+        Optional<UUID> requesterId = requests.incomingRequester(player.getUniqueId());
+        if (requesterId.isPresent()) {
+            Player requester = Bukkit.getPlayer(requesterId.get());
             if (requester != null) {
                 player.sendMessage(Component.text("Pending request from " + requester.getName() + ":"));
                 sendButtonLine(player, button("[ Accept ]", "/tpa"), button("[ Decline ]", "/tpd"));
             }
         }
-        if (outgoing.containsKey(player.getUniqueId())) {
+        if (requests.hasOutgoing(player.getUniqueId())) {
             sendButtonLine(player, button("[ Cancel request ]", "/tpr cancel"));
         }
         return true;
@@ -199,7 +193,11 @@ public final class TpcePlugin extends JavaPlugin implements Listener, CommandExe
             return true;
         }
         if (args[0].equalsIgnoreCase("cancel") && args.length == 1) {
-            cancelOutgoingRequest(player, true);
+            if (requests.cancelOutgoing(player.getUniqueId())) {
+                player.sendMessage(Component.text("Teleport request cancelled."));
+            } else {
+                player.sendMessage(Component.text("You have no outgoing teleport request."));
+            }
             return true;
         }
         if (args[0].equalsIgnoreCase("page")) {
@@ -253,93 +251,54 @@ public final class TpcePlugin extends JavaPlugin implements Listener, CommandExe
     }
 
     private void sendRequest(Player requester, Player target) {
-        if (requester.equals(target)) {
-            requester.sendMessage(Component.text("You cannot teleport to yourself."));
-            return;
-        }
-        Request existingIncoming = incoming.get(target.getUniqueId());
-        if (existingIncoming != null && !existingIncoming.requester().equals(requester.getUniqueId())) {
-            requester.sendMessage(Component.text(target.getName() + " already has a pending teleport request."));
-            return;
-        }
-        Request existingOutgoing = outgoing.get(requester.getUniqueId());
-        if (existingOutgoing != null) {
-            if (existingOutgoing.target().equals(target.getUniqueId())) {
-                requester.sendMessage(Component.text("You already have a request pending for " + target.getName() + "."));
-                return;
+        RequestManager.SendOutcome outcome = requests.send(requester.getUniqueId(), target.getUniqueId());
+        switch (outcome) {
+            case SELF -> requester.sendMessage(Component.text("You cannot teleport to yourself."));
+            case TARGET_HAS_OTHER_REQUEST ->
+                    requester.sendMessage(Component.text(target.getName() + " already has a pending teleport request."));
+            case ALREADY_PENDING_FOR_TARGET ->
+                    requester.sendMessage(Component.text("You already have a request pending for " + target.getName() + "."));
+            case SENT -> {
+                requester.sendMessage(Component.text("Teleport request sent to " + target.getName() + "."));
+                target.sendMessage(Component.text(requester.getName() + " wants to teleport to you."));
+                sendButtonLine(target, button("[ Accept ]", "/tpa"), button("[ Decline ]", "/tpd"));
             }
-            cancelOutgoingRequest(requester, false);
         }
-        UUID requesterId = requester.getUniqueId();
-        UUID targetId = target.getUniqueId();
-        BukkitTask expirationTask = Bukkit.getScheduler().runTaskLater(this,
-                () -> expireRequest(requesterId), secondsToTicks(settings.requestExpirationSeconds()));
-        Request request = new Request(requesterId, targetId, expirationTask);
-        outgoing.put(requesterId, request);
-        incoming.put(targetId, request);
-        requester.sendMessage(Component.text("Teleport request sent to " + target.getName() + "."));
-        target.sendMessage(Component.text(requester.getName() + " wants to teleport to you."));
-        sendButtonLine(target, button("[ Accept ]", "/tpa"), button("[ Decline ]", "/tpd"));
     }
 
     private boolean acceptRequest(Player target) {
-        Request request = incoming.remove(target.getUniqueId());
-        if (request == null) {
+        Optional<UUID> requesterId = requests.accept(target.getUniqueId());
+        if (requesterId.isEmpty()) {
             target.sendMessage(Component.text("You have no pending teleport request."));
             return true;
         }
-        outgoing.remove(request.requester(), request);
-        request.expirationTask().cancel();
-        Player requester = Bukkit.getPlayer(request.requester());
+        Player requester = Bukkit.getPlayer(requesterId.get());
         if (requester == null) {
             target.sendMessage(Component.text("The requester is no longer online."));
             return true;
         }
         target.sendMessage(Component.text("Teleport request accepted."));
         requester.sendMessage(Component.text(target.getName() + " accepted your teleport request."));
-        beginTeleport(requester, target.getLocation(), target.getName());
+        teleports.begin(requester, target.getLocation(), target.getName());
         return true;
     }
 
     private boolean declineRequest(Player target) {
-        Request request = incoming.remove(target.getUniqueId());
-        if (request == null) {
+        Optional<UUID> requesterId = requests.decline(target.getUniqueId());
+        if (requesterId.isEmpty()) {
             target.sendMessage(Component.text("You have no pending teleport request."));
             return true;
         }
-        outgoing.remove(request.requester(), request);
-        request.expirationTask().cancel();
         target.sendMessage(Component.text("Teleport request declined."));
-        Player requester = Bukkit.getPlayer(request.requester());
+        Player requester = Bukkit.getPlayer(requesterId.get());
         if (requester != null) requester.sendMessage(Component.text(target.getName() + " declined your teleport request."));
         return true;
-    }
-
-    private void expireRequest(UUID requesterId) {
-        Request request = outgoing.remove(requesterId);
-        if (request == null) return;
-        incoming.remove(request.target(), request);
-        Player requester = Bukkit.getPlayer(requesterId);
-        if (requester != null) requester.sendMessage(Component.text("Teleport request expired."));
-        Player target = Bukkit.getPlayer(request.target());
-        if (target != null) target.sendMessage(Component.text("Teleport request expired."));
-    }
-
-    private void cancelOutgoingRequest(Player requester, boolean notify) {
-        Request request = outgoing.remove(requester.getUniqueId());
-        if (request == null) {
-            if (notify) requester.sendMessage(Component.text("You have no outgoing teleport request."));
-            return;
-        }
-        incoming.remove(request.target(), request);
-        request.expirationTask().cancel();
-        if (notify) requester.sendMessage(Component.text("Teleport request cancelled."));
     }
 
     private boolean handleHome(Player player, String[] args) {
         if (args.length == 0) {
             var primary = homes.getPrimary(player.getUniqueId());
-            if (primary.isPresent()) beginTeleport(player, primary.get(), "primary home");
+            if (primary.isPresent()) teleports.begin(player, primary.get(), "primary home");
             else showHomes(player);
             return true;
         }
@@ -349,7 +308,7 @@ public final class TpcePlugin extends JavaPlugin implements Listener, CommandExe
         }
         if (args[0].equalsIgnoreCase("set")) {
             if (args.length < 2 || args.length > 3) {
-                player.sendMessage(Component.text("Usage: /home set <name> [primary]"));
+                player.sendMessage(Component.text("Usage: /home set <n> [primary]"));
                 return true;
             }
             String name = args[1].trim();
@@ -359,7 +318,7 @@ public final class TpcePlugin extends JavaPlugin implements Listener, CommandExe
             }
             boolean makePrimary = args.length == 3;
             if (makePrimary && !args[2].equalsIgnoreCase("primary")) {
-                player.sendMessage(Component.text("Usage: /home set <name> [primary]"));
+                player.sendMessage(Component.text("Usage: /home set <n> [primary]"));
                 return true;
             }
             try {
@@ -408,10 +367,10 @@ public final class TpcePlugin extends JavaPlugin implements Listener, CommandExe
                 showHomes(player);
                 return true;
             }
-            beginTeleport(player, home.get(), "home " + args[0]);
+            teleports.begin(player, home.get(), "home " + args[0]);
             return true;
         }
-        player.sendMessage(Component.text("Usage: /home [name|list|set <name> [primary]|delete <name>|primary <name>]"));
+        player.sendMessage(Component.text("Usage: /home [name|list|set <n> [primary]|delete <n>|primary <n>]"));
         return true;
     }
 
@@ -441,12 +400,12 @@ public final class TpcePlugin extends JavaPlugin implements Listener, CommandExe
     }
 
     private boolean teleportBack(Player player) {
-        Location destination = backLocations.get(player.getUniqueId());
-        if (destination == null) {
+        Optional<Location> destination = teleports.backLocation(player.getUniqueId());
+        if (destination.isEmpty()) {
             player.sendMessage(Component.text("No previous location is available."));
             return true;
         }
-        beginTeleport(player, destination, "previous location");
+        teleports.begin(player, destination.get(), "previous location");
         return true;
     }
 
@@ -456,84 +415,13 @@ public final class TpcePlugin extends JavaPlugin implements Listener, CommandExe
             player.sendMessage(Component.text("You do not have a valid bed location."));
             return true;
         }
-        beginTeleport(player, destination, "bed");
+        teleports.begin(player, destination, "bed");
         return true;
     }
 
     private boolean teleportSpawn(Player player) {
-        beginTeleport(player, player.getWorld().getSpawnLocation(), "spawn");
+        teleports.begin(player, player.getWorld().getSpawnLocation(), "spawn");
         return true;
-    }
-
-    private void beginTeleport(Player player, Location destination, String reason) {
-        UUID id = player.getUniqueId();
-        long now = System.currentTimeMillis();
-        long cooldown = cooldownUntil.getOrDefault(id, 0L);
-        if (cooldown > now) {
-            long seconds = (cooldown - now + 999L) / 1000L;
-            player.sendMessage(Component.text("You cannot teleport yet. Please wait " + seconds + " seconds."));
-            return;
-        }
-        World world = destination.getWorld();
-        if (world == null || Bukkit.getWorld(world.getUID()) == null) {
-            player.sendMessage(Component.text("Teleport failed: destination world is unavailable."));
-            getLogger().warning("Teleport rejected for " + player.getName() + ": unavailable world for " + reason + ".");
-            return;
-        }
-        if (settings.requireSafeDestination() && !isSafe(destination)) {
-            player.sendMessage(Component.text("That destination is not safe."));
-            return;
-        }
-        cancelTeleport(player, false);
-        Location source = player.getLocation().clone();
-        Location target = destination.clone();
-        UUID playerId = player.getUniqueId();
-        final BukkitTask[] taskHolder = new BukkitTask[1];
-        BukkitTask task = Bukkit.getScheduler().runTaskLater(this, () -> {
-            PendingTeleport pending = pendingTeleports.get(playerId);
-            if (pending == null || pending.task() != taskHolder[0]) return;
-            completeTeleport(player, pending);
-        }, secondsToTicks(settings.teleportDelaySeconds()));
-        taskHolder[0] = task;
-        pendingTeleports.put(id, new PendingTeleport(source, target, reason, task));
-        player.sendMessage(Component.text("Teleporting in " + settings.teleportDelaySeconds() + " seconds..."));
-    }
-
-    private void completeTeleport(Player player, PendingTeleport pending) {
-        UUID id = player.getUniqueId();
-        if (pendingTeleports.get(id) != pending) return;
-        pendingTeleports.remove(id);
-        if (!player.isOnline()) return;
-        if (settings.requireSafeDestination() && !isSafe(pending.destination())) {
-            player.sendMessage(Component.text("Teleport failed: the destination is no longer safe."));
-            return;
-        }
-        if (!player.teleport(pending.destination())) {
-            player.sendMessage(Component.text("Teleport failed: the server rejected the teleport."));
-            getLogger().warning("Teleport rejected for " + player.getName() + " to " + pending.reason() + ".");
-            return;
-        }
-        backLocations.put(id, pending.source());
-        if (settings.teleportCooldownSeconds() > 0) {
-            cooldownUntil.put(id, System.currentTimeMillis() + settings.teleportCooldownSeconds() * 1000L);
-        }
-        player.sendMessage(Component.text("Teleported to " + pending.reason() + "."));
-    }
-
-    private void cancelTeleport(Player player, boolean notify) {
-        PendingTeleport pending = pendingTeleports.remove(player.getUniqueId());
-        if (pending == null) return;
-        pending.task().cancel();
-        if (notify) player.sendMessage(Component.text("Teleport cancelled."));
-    }
-
-    private boolean isSafe(Location location) {
-        World world = location.getWorld();
-        if (world == null) return false;
-        Block feet = location.getBlock();
-        Block head = feet.getRelative(0, 1, 0);
-        Block ground = feet.getRelative(0, -1, 0);
-        return feet.isPassable() && head.isPassable() && ground.getType().isSolid();
     }
 
     @EventHandler
@@ -542,13 +430,13 @@ public final class TpcePlugin extends JavaPlugin implements Listener, CommandExe
         Location from = event.getFrom();
         Location to = event.getTo();
         if (to == null || (from.getX() == to.getX() && from.getY() == to.getY() && from.getZ() == to.getZ())) return;
-        cancelTeleport(event.getPlayer(), true);
+        teleports.cancel(event.getPlayer(), true);
     }
 
     @EventHandler
     public void onDamage(EntityDamageEvent event) {
         if (!settings.cancelOnDamage() || event.isCancelled() || !(event.getEntity() instanceof Player player)) return;
-        cancelTeleport(player, true);
+        teleports.cancel(player, true);
     }
 
     @EventHandler
@@ -560,23 +448,19 @@ public final class TpcePlugin extends JavaPlugin implements Listener, CommandExe
     public void onQuit(PlayerQuitEvent event) {
         Player player = event.getPlayer();
         UUID id = player.getUniqueId();
-        cancelTeleport(player, false);
-        backLocations.remove(id);
-        cooldownUntil.remove(id);
-        Request incomingRequest = incoming.remove(id);
-        if (incomingRequest != null) {
-            outgoing.remove(incomingRequest.requester(), incomingRequest);
-            incomingRequest.expirationTask().cancel();
-            Player requester = Bukkit.getPlayer(incomingRequest.requester());
-            if (requester != null) requester.sendMessage(Component.text(player.getName() + " is no longer online. Teleport request cancelled."));
-        }
-        Request outgoingRequest = outgoing.remove(id);
-        if (outgoingRequest != null) {
-            incoming.remove(outgoingRequest.target(), outgoingRequest);
-            outgoingRequest.expirationTask().cancel();
-            Player target = Bukkit.getPlayer(outgoingRequest.target());
-            if (target != null) target.sendMessage(Component.text(player.getName() + " is no longer online. Teleport request cancelled."));
-        }
+        teleports.onQuit(player);
+        requests.removeIncomingFor(id).ifPresent(requesterId -> {
+            Player requester = Bukkit.getPlayer(requesterId);
+            if (requester != null) {
+                requester.sendMessage(Component.text(player.getName() + " is no longer online. Teleport request cancelled."));
+            }
+        });
+        requests.removeOutgoingFor(id).ifPresent(targetId -> {
+            Player target = Bukkit.getPlayer(targetId);
+            if (target != null) {
+                target.sendMessage(Component.text(player.getName() + " is no longer online. Teleport request cancelled."));
+            }
+        });
     }
 
     @Override
@@ -629,16 +513,4 @@ public final class TpcePlugin extends JavaPlugin implements Listener, CommandExe
         }
         return true;
     }
-
-    private static long secondsToTicks(int seconds) {
-        return seconds * 20L;
-    }
-
-    private record Settings(int requestExpirationSeconds, int teleportDelaySeconds, int teleportCooldownSeconds,
-                            int homeLimit, boolean requireSafeDestination, boolean cancelOnMovement,
-                            boolean cancelOnDamage) { }
-
-    private record Request(UUID requester, UUID target, BukkitTask expirationTask) { }
-
-    private record PendingTeleport(Location source, Location destination, String reason, BukkitTask task) { }
 }
