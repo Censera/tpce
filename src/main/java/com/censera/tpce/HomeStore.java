@@ -4,7 +4,7 @@ import org.bukkit.Bukkit;
 import org.bukkit.Location;
 import org.bukkit.World;
 import org.bukkit.configuration.ConfigurationSection;
-import org.bukkit.configuration.file.YamlConfiguration;
+import org.bukkit.configuration.YamlConfiguration;
 import org.bukkit.plugin.java.JavaPlugin;
 
 import java.io.File;
@@ -12,6 +12,8 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
@@ -54,42 +56,44 @@ final class HomeStore {
                 continue;
             }
 
-            ConfigurationSection section = players.getConfigurationSection(playerKey);
-            if (section == null) {
+            ConfigurationSection playerSection = players.getConfigurationSection(playerKey);
+            if (playerSection == null) {
                 continue;
             }
 
-            Optional.ofNullable(section.getString("primary"))
-                    .ifPresent(name -> primary.put(playerId, normalize(name)));
-
-            ConfigurationSection playerHomes = section.getConfigurationSection("homes");
+            ConfigurationSection playerHomes = playerSection.getConfigurationSection("homes");
             if (playerHomes == null) {
                 continue;
             }
 
             Map<String, Location> loaded = new LinkedHashMap<>();
-            for (String name : playerHomes.getKeys(false)) {
-                ConfigurationSection home = playerHomes.getConfigurationSection(name);
+            for (String rawName : playerHomes.getKeys(false)) {
+                String name = normalize(rawName);
+                ConfigurationSection home = playerHomes.getConfigurationSection(rawName);
                 if (home == null) {
+                    plugin.getLogger().warning("Ignoring home " + rawName + " for " + playerId + ": invalid entry");
                     continue;
                 }
-                Optional<String> worldId = Optional.ofNullable(home.getString("world"));
-                if (worldId.isEmpty()) {
-                    plugin.getLogger().warning("Ignoring home " + name + " for " + playerId + ": world is missing");
+
+                String worldValue = home.getString("world");
+                if (worldValue == null) {
+                    plugin.getLogger().warning("Ignoring home " + rawName + " for " + playerId + ": world is missing");
                     continue;
                 }
+
                 World world;
                 try {
-                    world = Bukkit.getWorld(UUID.fromString(worldId.get()));
+                    world = Bukkit.getWorld(UUID.fromString(worldValue));
                 } catch (IllegalArgumentException e) {
-                    plugin.getLogger().warning("Ignoring home " + name + " for " + playerId + ": invalid world");
+                    plugin.getLogger().warning("Ignoring home " + rawName + " for " + playerId + ": invalid world UUID");
                     continue;
                 }
                 if (world == null) {
-                    plugin.getLogger().warning("Ignoring home " + name + " for " + playerId + ": world is unavailable");
+                    plugin.getLogger().warning("Ignoring home " + rawName + " for " + playerId + ": world is unavailable");
                     continue;
                 }
-                loaded.put(normalize(name), new Location(
+
+                loaded.put(name, new Location(
                         world,
                         home.getDouble("x"),
                         home.getDouble("y"),
@@ -97,23 +101,49 @@ final class HomeStore {
                         (float) home.getDouble("yaw"),
                         (float) home.getDouble("pitch")
                 ));
+
+                if (loaded.size() == limit) {
+                    break;
+                }
             }
+
             if (!loaded.isEmpty()) {
                 homes.put(playerId, loaded);
+            }
+
+            String primaryName = playerSection.getString("primary");
+            if (primaryName != null) {
+                String normalized = normalize(primaryName);
+                if (loaded.containsKey(normalized)) {
+                    primary.put(playerId, normalized);
+                } else {
+                    plugin.getLogger().warning("Ignoring invalid primary home for " + playerId + ": " + primaryName);
+                }
             }
         }
     }
 
     void save() throws IOException {
+        if (!plugin.getDataFolder().exists() && !plugin.getDataFolder().mkdirs()) {
+            throw new IOException("Could not create plugin data directory: " + plugin.getDataFolder());
+        }
+
         YamlConfiguration config = new YamlConfiguration();
         for (Map.Entry<UUID, Map<String, Location>> player : homes.entrySet()) {
             String base = "players." + player.getKey();
-            Optional.ofNullable(primary.get(player.getKey()))
-                    .ifPresent(name -> config.set(base + ".primary", name));
+            String primaryName = primary.get(player.getKey());
+            if (primaryName != null) {
+                config.set(base + ".primary", primaryName);
+            }
+
             for (Map.Entry<String, Location> home : player.getValue().entrySet()) {
-                String path = base + ".homes." + home.getKey();
                 Location location = home.getValue();
-                config.set(path + ".world", location.getWorld().getUID().toString());
+                World world = location.getWorld();
+                if (world == null) {
+                    throw new IOException("Home " + home.getKey() + " for " + player.getKey() + " has no world");
+                }
+                String path = base + ".homes." + home.getKey();
+                config.set(path + ".world", world.getUID().toString());
                 config.set(path + ".x", location.getX());
                 config.set(path + ".y", location.getY());
                 config.set(path + ".z", location.getZ());
@@ -131,43 +161,93 @@ final class HomeStore {
         this.limit = limit;
     }
 
-    boolean set(UUID player, String name, Location location) {
+    void set(UUID player, String name, Location location) throws IOException {
         String key = normalize(name);
         Map<String, Location> playerHomes = homes.computeIfAbsent(player, ignored -> new LinkedHashMap<>());
         if (!playerHomes.containsKey(key) && playerHomes.size() >= limit) {
-            return false;
+            throw new IOException("Home limit reached for player " + player);
         }
-        playerHomes.put(key, location.clone());
-        primary.putIfAbsent(player, key);
-        return true;
+
+        Location previous = playerHomes.put(key, location.clone());
+        if (primary.putIfAbsent(player, key) == null) {
+            try {
+                save();
+            } catch (IOException e) {
+                primary.remove(player);
+                playerHomes.remove(key);
+                if (previous != null) {
+                    playerHomes.put(key, previous);
+                }
+                if (playerHomes.isEmpty()) {
+                    homes.remove(player);
+                }
+                throw e;
+            }
+            return;
+        }
+
+        try {
+            save();
+        } catch (IOException e) {
+            if (previous == null) {
+                playerHomes.remove(key);
+            } else {
+                playerHomes.put(key, previous);
+            }
+            throw e;
+        }
     }
 
-    boolean delete(UUID player, String name) {
+    boolean delete(UUID player, String name) throws IOException {
         Map<String, Location> playerHomes = homes.get(player);
         if (playerHomes == null) {
             return false;
         }
         String key = normalize(name);
-        if (playerHomes.remove(key) == null) {
+        Location removed = playerHomes.remove(key);
+        if (removed == null) {
             return false;
         }
-        if (key.equals(primary.get(player))) {
+
+        String previousPrimary = primary.get(player);
+        if (key.equals(previousPrimary)) {
             primary.remove(player);
         }
         if (playerHomes.isEmpty()) {
             homes.remove(player);
             primary.remove(player);
         }
+
+        try {
+            save();
+        } catch (IOException e) {
+            playerHomes.put(key, removed);
+            if (previousPrimary != null) {
+                primary.put(player, previousPrimary);
+            }
+            throw e;
+        }
         return true;
     }
 
-    boolean setPrimary(UUID player, String name) {
+    boolean setPrimary(UUID player, String name) throws IOException {
         String key = normalize(name);
         Map<String, Location> playerHomes = homes.get(player);
         if (playerHomes == null || !playerHomes.containsKey(key)) {
             return false;
         }
-        primary.put(player, key);
+
+        String previous = primary.put(player, key);
+        try {
+            save();
+        } catch (IOException e) {
+            if (previous == null) {
+                primary.remove(player);
+            } else {
+                primary.put(player, previous);
+            }
+            throw e;
+        }
         return true;
     }
 
@@ -185,7 +265,7 @@ final class HomeStore {
         return name == null ? Optional.empty() : get(player, name);
     }
 
-    java.util.List<String> names(UUID player) {
+    List<String> names(UUID player) {
         Map<String, Location> playerHomes = homes.get(player);
         return playerHomes == null
                 ? Collections.emptyList()
@@ -197,6 +277,6 @@ final class HomeStore {
     }
 
     private static String normalize(String name) {
-        return name.trim().toLowerCase();
+        return name.trim().toLowerCase(Locale.ROOT);
     }
 }
