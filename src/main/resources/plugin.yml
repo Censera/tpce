@@ -6,12 +6,11 @@ author: Censera
 description: Small teleportation utility for Paper 26.2.
 commands:
   tpce:
-    description: Manage tpce.
-    usage: /tpce reload
-    permission: tpce.reload
+    description: Open tpce or reload its configuration.
+    usage: /tpce [reload]
   tpr:
     description: Request to teleport to a player.
-    usage: /tpr [player]
+    usage: /tpr [player|cancel|page <number>]
     permission: tpce.request
   tpa:
     description: Accept a teleport request.
@@ -31,7 +30,7 @@ commands:
     permission: tpce.bed
   home:
     description: Manage and teleport to homes.
-    usage: /home [name|set <name> [primary]]
+    usage: /home [name|list|set <name> [primary]|delete <name>|primary <name>]
     permission: tpce.home
   spawn:
     description: Teleport to server spawn.
